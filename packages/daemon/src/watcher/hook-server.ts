@@ -108,13 +108,22 @@ export class HookServer {
         }, 10 * 60_000);
       });
 
-      // Qoder HTTP hook 期望的响应格式
+      // Qoder's PermissionRequest hook reads hookSpecificOutput
+      // .permissionDecision ("allow" | "deny" | "ask") — the old
+      // { decision: "accept" } shape was silently ignored, so a phone approval
+      // never reached the IDE (verified against the qodercli binary schema).
       return Response.json({
-        decision: decision === "allow" ? "accept" : "decline",
+        hookSpecificOutput: {
+          hookEventName: "PermissionRequest",
+          permissionDecision: decision === "allow" ? "allow" : "deny",
+          permissionDecisionReason: decision === "allow"
+            ? "已在手机上批准 (Argus)"
+            : "已在手机上拒绝或超时 (Argus)",
+        },
       });
     }
 
-    // 其他 hook 事件（PreToolUse/PostToolUse/Stop 等）：直接放行
-    return Response.json({ decision: "accept" });
+    // 其他 hook 事件（PreToolUse/PostToolUse/Stop 等）：不干预，交回本机决策
+    return Response.json({});
   }
 }
