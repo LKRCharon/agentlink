@@ -10,7 +10,9 @@
 import type { SecureChannel } from "@agentlink/wire";
 import { b64decode } from "@agentlink/wire";
 import type { NormalizedEvent } from "../agent/types";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { WsConn, joinChan } from "../client";
@@ -41,6 +43,44 @@ export async function serveWatch(
   };
   const queueUserInput = (sessionId: string, text: string): void => {
     appendFileSync(inboxPath(), JSON.stringify({ at: Date.now(), sessionId, text }) + "\n");
+  };
+
+  /** Newest installed qodercli binary, or null when Qoder isn't present. */
+  const qoderCli = (): string | null => {
+    const base = join(homedir(), ".qoder", "bin", "qodercli");
+    if (!existsSync(base)) return null;
+    try {
+      const versions = readdirSync(base)
+        .filter((f) => f.startsWith("qodercli-"))
+        .sort()
+        .reverse();
+      for (const v of versions) {
+        const p = join(base, v);
+        if (existsSync(p)) return p;
+      }
+    } catch {}
+    return null;
+  };
+
+  /** Run a phone-sent prompt as a headless qodercli session in `cwd`. The run
+   *  writes its own transcript, so the watcher streams progress back to the
+   *  phone with no extra plumbing. Permission prompts are skipped by design
+   *  (owner's explicit choice); set AGENTLINK_EXEC=0 to disable execution and
+   *  fall back to inbox-only queuing. */
+  const execUserInput = (text: string, cwd: string): { ok: boolean; note: string } => {
+    const cli = qoderCli();
+    if (!cli) return { ok: false, note: "未找到 qodercli，已存入收件箱" };
+    try {
+      const child = spawn(cli, ["-p", text, "--dangerously-skip-permissions"], {
+        cwd,
+        stdio: "ignore",
+        detached: true,
+      });
+      child.unref();
+      return { ok: true, note: `已在 Mac 上执行（${cwd}）` };
+    } catch (e) {
+      return { ok: false, note: `启动失败: ${e instanceof Error ? e.message : e}` };
+    }
   };
 
   const hookServer = new HookServer(async (req) => {
@@ -143,12 +183,21 @@ export async function serveWatch(
           // 手机端据此显示排队状态而不是石沉大海。
           queueUserInput(payload.sessionId, payload.text);
           emit({ type: "user_input", session: payload.sessionId, text: payload.text.slice(0, 100) });
-          console.log(`[watch] 手机端输入已入收件箱: ${payload.text.slice(0, 100)}`);
+          // Injecting into a running IDE session isn't possible, so run the
+          // prompt as its own headless session in that session's cwd.
+          const cwd = watcher.cwdBySession.get(payload.sessionId)
+            ?? codexWatcher.cwdBySession.get(payload.sessionId)
+            ?? homedir();
+          const execEnabled = process.env.AGENTLINK_EXEC !== "0";
+          const result = execEnabled
+            ? execUserInput(payload.text, cwd)
+            : { ok: false, note: "已存入收件箱（执行已禁用）" };
+          console.log(`[watch] 手机端输入 ${result.ok ? "已执行" : "已入收件箱"}: ${payload.text.slice(0, 100)}`);
           await sendPayload({
             kind: "input-ack",
             sessionId: payload.sessionId,
-            status: "queued",
-            note: "已送达 Mac · 暂不支持注入 IDE 会话，已存入收件箱",
+            status: result.ok ? "running" : "queued",
+            note: result.note,
           });
         }
       } catch {

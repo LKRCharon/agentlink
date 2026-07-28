@@ -17,6 +17,10 @@ interface WatchedFile {
 }
 
 export class TranscriptWatcher {
+  /** sessionId -> cwd, harvested from transcript lines. Remote execution needs
+   *  the originating working directory; both formats carry it (qoder: top-level
+   *  `cwd`, codex: `turn_context.payload.cwd`). */
+  readonly cwdBySession = new Map<string, string>();
   private files = new Map<string, WatchedFile>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private readonly pollMs: number;
@@ -120,6 +124,8 @@ export class TranscriptWatcher {
       if (!trimmed) continue;
       try {
         const obj = JSON.parse(trimmed);
+        const cwd = obj?.cwd ?? obj?.payload?.cwd;
+        if (typeof cwd === "string" && cwd) this.cwdBySession.set(sessionId, cwd);
         const events = this.normalizer(obj);
         for (const ev of events) {
           this.onEvent(sessionId, this.agentName, ev);
