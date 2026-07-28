@@ -1,0 +1,9 @@
+{
+  "name": "agentlink",
+  "short_name": "agentlink",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "orientation": "portrait"
+}

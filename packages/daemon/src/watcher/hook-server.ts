@@ -1,0 +1,120 @@
+/**
+ * Hook HTTP server：接收 Qoder 的 PermissionRequest 等 hook 事件。
+ * 共享密钥鉴权（X-Agentlink-Secret header），防止本机其他进程伪造请求。
+ */
+
+import { readFileSync, writeFileSync, existsSync, chmodSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+
+export interface HookPermissionRequest {
+  sessionId: string;
+  requestId: string;
+  toolName: string;
+  summary: string;
+  options: { id: string; label: string }[];
+  /** 桥接层调用：把手机端的审批结果回传 */
+  resolve: (decision: string) => void;
+}
+
+export class HookServer {
+  private server: ReturnType<typeof Bun.serve> | null = null;
+  private pendingPermissions = new Map<string, HookPermissionRequest>();
+
+  constructor(
+    private onPermissionRequest: (req: HookPermissionRequest) => void,
+    private port = 9876,
+  ) {}
+
+  /** 生成或加载共享密钥，打印 Qoder settings.json 配置片段 */
+  static getOrCreateSecret(): string {
+    const file = join(process.env.AGENTLINK_HOME ?? join(homedir(), ".agentlink"), "hook-secret");
+    if (existsSync(file)) {
+      return readFileSync(file, "utf8").trim();
+    }
+    const secret = Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(24))).toString("hex");
+    writeFileSync(file, secret, { mode: 0o600 });
+    chmodSync(file, 0o600);
+    return secret;
+  }
+
+  start(secret: string): void {
+    this.server = Bun.serve({
+      port: this.port,
+      hostname: "127.0.0.1", // 只绑 localhost，不暴露到网络
+      fetch: (req) => this.handleRequest(req, secret),
+    });
+    console.log(`[hook-server] listening on http://127.0.0.1:${this.port}`);
+  }
+
+  stop(): void {
+    this.server?.stop();
+    this.server = null;
+  }
+
+  /** 桥接层调用：手机端审批结果到达后，解除挂起的 hook 请求 */
+  resolvePermission(requestId: string, decision: string): void {
+    const pending = this.pendingPermissions.get(requestId);
+    if (pending) {
+      this.pendingPermissions.delete(requestId);
+      pending.resolve(decision);
+    }
+  }
+
+  private async handleRequest(req: Request, secret: string): Promise<Response> {
+    // 鉴权
+    const authHeader = req.headers.get("X-Agentlink-Secret");
+    if (authHeader !== secret) {
+      return new Response("unauthorized", { status: 401 });
+    }
+
+    if (req.method !== "POST" || new URL(req.url).pathname !== "/hook") {
+      return new Response("not found", { status: 404 });
+    }
+
+    let body: any;
+    try {
+      body = await req.json();
+    } catch {
+      return new Response("bad json", { status: 400 });
+    }
+
+    // PermissionRequest hook → 转发到手机，挂起等待响应
+    if (body?.hookEvent === "PermissionRequest" || body?.type === "PermissionRequest") {
+      const requestId = `hook-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const toolName = body.toolCall?.title ?? body.toolName ?? body.tool ?? "unknown";
+      const summary = JSON.stringify(body.toolCall?.rawInput ?? body.input ?? body).slice(0, 200);
+
+      const decision = await new Promise<string>((resolve) => {
+        const hookReq: HookPermissionRequest = {
+          sessionId: body.sessionId ?? "qoder-ide",
+          requestId,
+          toolName,
+          summary,
+          options: [
+            { id: "allow", label: "允许" },
+            { id: "deny", label: "拒绝" },
+          ],
+          resolve,
+        };
+        this.pendingPermissions.set(requestId, hookReq);
+        this.onPermissionRequest(hookReq);
+
+        // 10 分钟超时自动拒绝
+        setTimeout(() => {
+          if (this.pendingPermissions.delete(requestId)) {
+            resolve("deny");
+          }
+        }, 10 * 60_000);
+      });
+
+      // Qoder HTTP hook 期望的响应格式
+      return Response.json({
+        decision: decision === "allow" ? "accept" : "decline",
+      });
+    }
+
+    // 其他 hook 事件（PreToolUse/PostToolUse/Stop 等）：直接放行
+    return Response.json({ decision: "accept" });
+  }
+}

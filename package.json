@@ -1,0 +1,23 @@
+{
+  "name": "agentlink",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "relay": "bun run packages/relay/src/index.ts",
+    "daemon": "bun run packages/daemon/src/index.ts",
+    "dev": "bun run --filter @agentlink/app dev",
+    "build:app": "bun run --filter @agentlink/app build",
+    "e2e": "bun run scripts/e2e.ts",
+    "e2e:agent": "bun run scripts/e2e-agent.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "bun-types": "^1.2.0",
+    "typescript": "^5.6.0"
+  }
+}
