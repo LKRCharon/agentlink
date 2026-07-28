@@ -196,7 +196,7 @@ export function normalizeQoderLine(line: unknown): NormalizedEvent[] {
         events.push({
           type: "tool-call",
           name: block.name ?? "tool",
-          summary: safeStringify(block.input).slice(0, 200),
+          summary: toolSummary(block.name ?? "tool", block.input).slice(0, 200),
         });
       }
     }
@@ -245,10 +245,14 @@ export function normalizeCodexLine(line: unknown): NormalizedEvent[] {
       }
     }
   } else if (obj.type === "response_item" && obj.payload?.type === "function_call") {
+    let args: unknown = obj.payload.arguments;
+    if (typeof args === "string") {
+      try { args = JSON.parse(args); } catch {}
+    }
     events.push({
       type: "tool-call",
       name: obj.payload.name ?? "tool",
-      summary: safeStringify(obj.payload.arguments).slice(0, 200),
+      summary: toolSummary(obj.payload.name ?? "tool", args).slice(0, 200),
     });
   } else if (obj.type === "response_item" && obj.payload?.type === "function_call_output") {
     events.push({ type: "tool-result", name: "tool", summary: outputText(obj.payload.output).slice(0, 200) });
@@ -265,11 +269,16 @@ export function normalizeCodexLine(line: unknown): NormalizedEvent[] {
       .filter(Boolean);
     if (parts.length) events.push({ type: "thinking", text: parts.join(" · ").slice(0, 300) });
   } else if (obj.type === "response_item" && obj.payload?.type === "custom_tool_call") {
-    events.push({
-      type: "tool-call",
-      name: obj.payload.name ?? "tool",
-      summary: String(obj.payload.input ?? "").slice(0, 200),
-    });
+    const name = obj.payload.name ?? "tool";
+    const cmds = codexExecCommands(obj.payload.input);
+    if (cmds.length) {
+      // One row per command — a single blob of wrapper JS is unreadable.
+      for (const cmd of cmds) {
+        events.push({ type: "tool-call", name, summary: cmd.slice(0, 200) });
+      }
+    } else {
+      events.push({ type: "tool-call", name, summary: String(obj.payload.input ?? "").slice(0, 200) });
+    }
   } else if (obj.type === "response_item" && obj.payload?.type === "custom_tool_call_output") {
     events.push({ type: "tool-result", name: obj.payload.name ?? "tool", summary: outputText(obj.payload.output).slice(0, 200) });
   } else if (obj.type === "event_msg" && obj.payload?.type === "task_complete") {
@@ -281,6 +290,49 @@ export function normalizeCodexLine(line: unknown): NormalizedEvent[] {
   }
 
   return events;
+}
+
+/** The one field worth showing per tool, Codex-activity-list style: the
+ *  command, the path, the query — never the whole argument object. Falls back
+ *  to compact JSON for unknown tools. */
+function toolSummary(name: string, input: unknown): string {
+  if (typeof input === "string") return input;
+  const o = (input ?? {}) as Record<string, unknown>;
+  const pick = (...keys: string[]): string | undefined => {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "string" && v.trim()) return v.trim();
+    }
+    return undefined;
+  };
+  const direct = pick("command", "cmd", "file_path", "path", "regex", "query", "url", "pattern");
+  if (direct) return direct;
+  const n = name.toLowerCase();
+  if (n.includes("todo")) {
+    const todos = o.todos;
+    return Array.isArray(todos) ? `${todos.length} items` : "";
+  }
+  if (n === "agent" || n.includes("task")) return pick("description", "prompt") ?? "";
+  return safeStringify(input);
+}
+
+/** codex `exec` input is JS calling tools.exec_command({ cmd: "…" }) — one call
+ *  or several. Pull the commands out so each becomes its own activity row
+ *  (matching how Codex itself lists "ran multiple commands"). */
+function codexExecCommands(input: unknown): string[] {
+  if (typeof input !== "string") return [];
+  const out: string[] = [];
+  // cmd: "..." with escaped quotes inside
+  const re = /cmd:\s*"((?:[^"\\]|\\.)*)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(input)) !== null) {
+    try {
+      out.push(JSON.parse(`"${m[1]}"`));
+    } catch {
+      out.push(m[1]);
+    }
+  }
+  return out;
 }
 
 /** Injected blocks that ride along in the user role but nobody typed:
