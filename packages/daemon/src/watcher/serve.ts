@@ -19,6 +19,7 @@ import { WsConn, joinChan } from "../client";
 import { TranscriptWatcher, findQoderFiles, findCodexFiles, normalizeQoderLine, normalizeCodexLine } from "./transcript";
 import { HookServer } from "./hook-server";
 import { listPeers } from "../store";
+import { createCloudSession, listSessions, startRemoteControl, startSession } from "../sessions";
 
 export async function serveWatch(
   conn: WsConn,
@@ -173,26 +174,55 @@ export async function serveWatch(
           optionId?: string;
           text?: string;
           sessionId?: string;
+          cwd?: string;
         }>(msg.data?.enc);
 
-        if (payload?.kind === "permission-response" && payload.requestId) {
+        if (payload?.kind === "list-sessions") {
+          // The mirrored stream only ever showed sessions that emitted an event
+          // while the phone was connected; this answers with every session on
+          // disk, idle ones included.
+          await sendPayload({ kind: "session-list", sessions: listSessions(60) });
+        } else if (payload?.kind === "new-session" && payload.text) {
+          const r = startSession(payload.text, payload.cwd);
+          await sendPayload({
+            kind: "input-ack",
+            sessionId: payload.sessionId ?? "",
+            status: r.ok ? "running" : "queued",
+            note: r.note,
+          });
+        } else if (payload?.kind === "remote-control") {
+          const r = startRemoteControl({ name: payload.text, directory: payload.cwd });
+          await sendPayload({ kind: "input-ack", sessionId: "", status: r.ok ? "running" : "queued", note: r.note });
+        } else if (payload?.kind === "cloud-session" && payload.text) {
+          const r = await createCloudSession(payload.text, payload.cwd);
+          await sendPayload({
+            kind: "cloud-session-url",
+            url: r.url ?? "",
+            note: r.note,
+          });
+        } else if (payload?.kind === "permission-response" && payload.requestId) {
           // 手机端审批结果 → 解除 hook 等待
           hookServer.resolvePermission(payload.requestId, payload.optionId ?? "deny");
         } else if (payload?.kind === "user-input" && payload.text && payload.sessionId) {
           // 用户输入：注入运行中的 IDE 会话暂不可行 → 入收件箱 + 回执，
           // 手机端据此显示排队状态而不是石沉大海。
           queueUserInput(payload.sessionId, payload.text);
-          emit({ type: "user_input", session: payload.sessionId, text: payload.text.slice(0, 100) });
+          // Full text, not a preview: Argus types this verbatim into the IDE.
+          emit({ type: "user_input", session: payload.sessionId, text: payload.text });
           // Injecting into a running IDE session isn't possible, so run the
           // prompt as its own headless session in that session's cwd.
           const cwd = watcher.cwdBySession.get(payload.sessionId)
             ?? codexWatcher.cwdBySession.get(payload.sessionId)
             ?? homedir();
-          const execEnabled = process.env.AGENTLINK_EXEC !== "0";
-          const result = execEnabled
+          // Default route: hand the text to Argus, which types it into the
+          // IDE's *current* session (the CLI cannot resume IDE sessions).
+          // AGENTLINK_EXEC=1 opts into the old behaviour instead: spawn a
+          // separate headless qodercli run, which answers in its own session.
+          const spawnHeadless = process.env.AGENTLINK_EXEC === "1";
+          const result = spawnHeadless
             ? execUserInput(payload.text, cwd)
-            : { ok: false, note: "已存入收件箱（执行已禁用）" };
-          console.log(`[watch] 手机端输入 ${result.ok ? "已执行" : "已入收件箱"}: ${payload.text.slice(0, 100)}`);
+            : { ok: true, note: "已送到 Mac 上的 Qoder 会话" };
+          console.log(`[watch] 手机端输入 ${spawnHeadless ? "已起独立会话" : "已转交 Argus 注入"}: ${payload.text.slice(0, 100)}`);
           await sendPayload({
             kind: "input-ack",
             sessionId: payload.sessionId,
