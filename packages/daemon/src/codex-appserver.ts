@@ -50,6 +50,70 @@ type Pending = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+/**
+ * Turn history -> the phone's event vocabulary (text / user-text / thinking /
+ * tool-call / tool-result / turn-done). Anything unrecognised is skipped rather
+ * than guessed at, so a new item type shows up as missing content instead of
+ * garbage.
+ */
+function flattenTurns(turns: any[]): Record<string, unknown>[] {
+  const out: Record<string, unknown>[] = [];
+  for (const turn of turns) {
+    for (const item of turn?.items ?? []) {
+      switch (item?.type) {
+        case "userMessage": {
+          const text = (item.content ?? [])
+            .filter((c: any) => c?.type === "text" && typeof c.text === "string")
+            .map((c: any) => c.text)
+            .join("");
+          if (text.trim()) out.push({ type: "user-text", text: text.trim() });
+          break;
+        }
+        case "agentMessage":
+          if (typeof item.text === "string" && item.text.trim()) {
+            out.push({ type: "text", text: item.text });
+          }
+          break;
+        case "reasoning": {
+          // `summary` holds the headings Codex shows; `content` is the long form.
+          const summary = Array.isArray(item.summary) ? item.summary.join("\n") : "";
+          if (summary.trim()) out.push({ type: "thinking", text: summary });
+          break;
+        }
+        case "commandExecution":
+          out.push({
+            type: "tool-call",
+            name: "shell",
+            summary: String(item.command ?? item.parsedCmd ?? "").slice(0, 300),
+          });
+          break;
+        case "fileChange":
+          out.push({
+            type: "tool-call",
+            name: "edit",
+            summary: (item.changes ?? []).map((c: any) => c?.path).filter(Boolean).join(", ").slice(0, 300),
+          });
+          break;
+        case "mcpToolCall":
+          out.push({
+            type: "tool-call",
+            name: String(item.server ?? "mcp"),
+            summary: String(item.tool ?? "").slice(0, 200),
+          });
+          break;
+        default:
+          break;
+      }
+    }
+    // Only closed turns get a marker; an in-flight turn should stay "running".
+    const status = typeof turn?.status === "string" ? turn.status : turn?.status?.type;
+    if (status && status !== "inProgress" && status !== "running") {
+      out.push({ type: "turn-done", reason: String(status) });
+    }
+  }
+  return out;
+}
+
 export class CodexAppServer {
   private proc: ChildProcess | null = null;
   private ws: WebSocket | null = null;
@@ -205,12 +269,27 @@ export class CodexAppServer {
     }));
   }
 
-  /** Load a thread into the server so it can take input. Returns its turns. */
-  async resume(threadId: string): Promise<{ canAcceptDirectInput: boolean; turns: any[]; cwd?: string }> {
+  /**
+   * Load a thread into the server so it can take input, and flatten its history
+   * into the same event shape the live stream uses.
+   *
+   * Flattening happens here rather than on the phone: the item taxonomy
+   * (userMessage / reasoning / agentMessage / commandExecution / fileChange …)
+   * is app-server's, and teaching a second client about it would mean two places
+   * to update when it changes.
+   */
+  async resume(threadId: string): Promise<{
+    canAcceptDirectInput: boolean;
+    turns: any[];
+    events: Record<string, unknown>[];
+    cwd?: string;
+  }> {
     const res = await this.call<any>("thread/resume", { threadId });
+    const turns: any[] = res?.initialTurnsPage?.data ?? res?.thread?.turns ?? [];
     return {
       canAcceptDirectInput: res?.thread?.canAcceptDirectInput === true,
-      turns: res?.initialTurnsPage?.data ?? res?.thread?.turns ?? [],
+      turns,
+      events: flattenTurns(turns),
       cwd: res?.cwd,
     };
   }

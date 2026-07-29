@@ -86,6 +86,9 @@ export async function serveWatch(
     }
   };
 
+  /** Sessions whose injection Argus has not reported on yet. */
+  const pendingInjections = new Set<string>();
+
   const hookServer = new HookServer(async (req) => {
     await sendPayload({
       kind: "permission-request",
@@ -95,6 +98,16 @@ export async function serveWatch(
       toolName: req.toolName,
       summary: req.summary,
       options: req.options,
+    });
+  }, undefined, (sessionId, ok, note) => {
+    // Argus finished (or failed) an injection: correct the provisional ack so
+    // the phone stops showing "typing…" and learns why nothing happened.
+    if (!pendingInjections.delete(sessionId)) return;
+    enqueueSend({
+      kind: "input-ack",
+      sessionId,
+      status: ok ? "running" : "queued",
+      note: note || (ok ? "已输入到 Qoder" : "输入失败"),
     });
   });
 
@@ -366,7 +379,9 @@ export async function serveWatch(
               sessionId: payload.sessionId,
               canAcceptDirectInput: r.canAcceptDirectInput,
               cwd: r.cwd ?? "",
-              turns: r.turns,
+              // Flattened history, not raw turns: the phone speaks the event
+              // vocabulary, not app-server's item taxonomy.
+              events: r.events,
             });
           } catch (e) {
             await sendPayload({ kind: "codex-error", note: `${e instanceof Error ? e.message : e}` });
@@ -501,9 +516,6 @@ export async function serveWatch(
           // 手机端据此显示排队状态而不是石沉大海。
           queueUserInput(payload.sessionId, payload.text);
           // Full text, not a preview: Argus types this verbatim into the IDE.
-          emit({ type: "user_input", session: payload.sessionId, text: payload.text });
-          // Injecting into a running IDE session isn't possible, so run the
-          // prompt as its own headless session in that session's cwd.
           const cwd = watcher.cwdBySession.get(payload.sessionId)
             ?? codexWatcher.cwdBySession.get(payload.sessionId)
             ?? homedir();
@@ -511,17 +523,27 @@ export async function serveWatch(
           // IDE's *current* session (the CLI cannot resume IDE sessions).
           // AGENTLINK_EXEC=1 opts into the old behaviour instead: spawn a
           // separate headless qodercli run, which answers in its own session.
+          // The two routes are mutually exclusive: emitting the line for Argus
+          // *and* spawning a headless run executed the same prompt twice.
           const spawnHeadless = process.env.AGENTLINK_EXEC === "1";
-          const result = spawnHeadless
-            ? execUserInput(payload.text, cwd)
-            : { ok: true, note: "已送到 Mac 上的 Qoder 会话" };
-          console.log(`[watch] 手机端输入 ${spawnHeadless ? "已起独立会话" : "已转交 Argus 注入"}: ${payload.text.slice(0, 100)}`);
-          await sendPayload({
-            kind: "input-ack",
-            sessionId: payload.sessionId,
-            status: result.ok ? "running" : "queued",
-            note: result.note,
-          });
+          if (spawnHeadless) {
+            const result = execUserInput(payload.text, cwd);
+            console.log(`[watch] 手机端输入 已起独立会话: ${payload.text.slice(0, 100)}`);
+            await sendPayload({
+              kind: "input-ack", sessionId: payload.sessionId,
+              status: result.ok ? "running" : "queued", note: result.note,
+            });
+          } else {
+            // Provisional ack only. The real outcome arrives from Argus through
+            // /inject-result and replaces this one.
+            pendingInjections.add(payload.sessionId);
+            emit({ type: "user_input", session: payload.sessionId, text: payload.text });
+            console.log(`[watch] 手机端输入 已转交 Argus 注入: ${payload.text.slice(0, 100)}`);
+            await sendPayload({
+              kind: "input-ack", sessionId: payload.sessionId,
+              status: "running", note: "正在输入到 Mac 上的 Qoder…",
+            });
+          }
         }
       } catch {
         // 解密失败，忽略

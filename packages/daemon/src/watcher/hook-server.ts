@@ -24,6 +24,12 @@ export class HookServer {
   constructor(
     private onPermissionRequest: (req: HookPermissionRequest) => void,
     private port = 9876,
+    /**
+     * Argus posts the outcome of a keystroke injection here. Without it the
+     * phone was told "delivered" before anything was typed, so Qoder not running
+     * or missing Accessibility permission looked like success.
+     */
+    private onInjectionResult?: (sessionId: string, ok: boolean, note: string) => void,
   ) {}
 
   /** 生成或加载共享密钥，打印 Qoder settings.json 配置片段 */
@@ -73,7 +79,22 @@ export class HookServer {
       return new Response("unauthorized", { status: 401 });
     }
 
-    if (req.method !== "POST" || new URL(req.url).pathname !== "/hook") {
+    const path = new URL(req.url).pathname;
+    if (req.method === "POST" && path === "/inject-result") {
+      try {
+        const body: any = await req.json();
+        this.onInjectionResult?.(
+          String(body?.sessionId ?? ""),
+          body?.ok === true,
+          String(body?.note ?? ""),
+        );
+      } catch {
+        return new Response("bad json", { status: 400 });
+      }
+      return Response.json({ ok: true });
+    }
+
+    if (req.method !== "POST" || path !== "/hook") {
       return new Response("not found", { status: 404 });
     }
 
