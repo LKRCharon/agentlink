@@ -203,7 +203,10 @@ export async function serveWatch(
    * and asks for permission in a way the phone can answer. `-p` reports nothing
    * until its transcript lands.
    */
-  const startAcpSession = async (prompt: string, cwd: string): Promise<{ ok: boolean; note: string }> => {
+  const startAcpSession = async (
+    prompt: string,
+    cwd: string,
+  ): Promise<{ ok: boolean; note: string; sessionId?: string }> => {
     // Retire the oldest session when at capacity: Map preserves insertion order,
     // so the first key is the least recently started.
     while (acpBySession.size >= ACP_MAX_SESSIONS) {
@@ -267,7 +270,7 @@ export async function serveWatch(
           kind: "agent-event", sessionId, agent: "qoder",
           event: { type: "error", message: `${e instanceof Error ? e.message : e}` },
         }));
-      return { ok: true, note: `已在 ${cwd} 新建会话（可看到执行过程）` };
+      return { ok: true, note: `已在 ${cwd} 新建会话`, sessionId };
     } catch (e) {
       acp.stop();
       return { ok: false, note: `新建失败: ${e instanceof Error ? e.message : e}` };
@@ -359,6 +362,8 @@ export async function serveWatch(
           text?: string;
           sessionId?: string;
           cwd?: string;
+          /** Which agent a new session should use ("qoder" | "codex"). */
+          agent?: string;
         }>(msg.data?.enc);
 
         if (payload?.kind) {
@@ -447,14 +452,48 @@ export async function serveWatch(
           console.log(`[watch] 返回会话目录 ${rows.length} 条`);
           await sendPayload({ kind: "session-list", sessions: rows });
         } else if (payload?.kind === "new-session" && payload.text) {
-          // ACP by default (visible progress + answerable approvals);
-          // AGENTLINK_ACP=0 falls back to the silent `qodercli -p` route.
-          const r = process.env.AGENTLINK_ACP === "0"
-            ? startSession(payload.text, payload.cwd)
-            : await startAcpSession(payload.text, payload.cwd ?? homedir());
+          const wantCodex = payload.agent === "codex";
+          const cwd = payload.cwd ?? homedir();
+          let r: { ok: boolean; note: string; sessionId?: string };
+          if (wantCodex) {
+            // Codex owns its threads, so a new one is a protocol call and the
+            // first turn streams back like any other.
+            try {
+              const srv = await codexControl();
+              const threadId = await srv.startThread(cwd);
+              if (!threadId) throw new Error("thread/start 未返回 threadId");
+              const turnId = await srv.startTurn(threadId, payload.text);
+              if (turnId) activeTurns.set(threadId, turnId);
+              r = { ok: true, note: `已在 ${cwd} 新建 Codex 会话`, sessionId: threadId };
+            } catch (e) {
+              r = { ok: false, note: `新建失败: ${e instanceof Error ? e.message : e}` };
+            }
+          } else {
+            // ACP by default (visible progress + answerable approvals);
+            // AGENTLINK_ACP=0 falls back to the silent `qodercli -p` route.
+            r = process.env.AGENTLINK_ACP === "0"
+              ? startSession(payload.text, payload.cwd)
+              : await startAcpSession(payload.text, cwd);
+          }
+          const newId = r.sessionId;
+          if (newId) {
+            // Announce the session before its events arrive: the phone keys
+            // everything by sessionId, and events for an id it has never seen
+            // have nowhere to go — the agent's reply was invisible even though
+            // it had answered.
+            enqueueSend({
+              kind: "session-started",
+              sessionId: newId,
+              agent: wantCodex ? "codex" : "qoder",
+              cwd,
+              prompt: payload.text,
+            });
+          }
           await sendPayload({
             kind: "input-ack",
-            sessionId: payload.sessionId ?? "",
+            // The real id when we have one: an empty sessionId made the phone
+            // look up sessions[""] and silently drop the acknowledgement.
+            sessionId: newId ?? payload.sessionId ?? "",
             status: r.ok ? "running" : "queued",
             note: r.note,
           });
