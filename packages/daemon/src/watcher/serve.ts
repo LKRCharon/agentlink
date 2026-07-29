@@ -21,6 +21,7 @@ import { HookServer } from "./hook-server";
 import { listPeers } from "../store";
 import { createCloudSession, listSessions, startRemoteControl, startSession } from "../sessions";
 import { CodexAppServer } from "../codex-appserver";
+import { QoderAcp } from "../qoder-acp";
 
 export async function serveWatch(
   conn: WsConn,
@@ -156,6 +157,86 @@ export async function serveWatch(
   const activeTurns = new Map<string, string>();
   /** Approvals awaiting a phone answer: requestId -> app-server request id. */
   const pendingApprovals = new Map<string, number | string>();
+
+  /**
+   * Phone-started Qoder sessions, one ACP agent process each. Capped: every
+   * entry is a live qodercli, so an unbounded map would quietly accumulate
+   * processes for the lifetime of the daemon.
+   */
+  const acpBySession = new Map<string, QoderAcp>();
+  const ACP_MAX_SESSIONS = 4;
+  /** Which ACP agent parked which permission request. */
+  const acpPermissions = new Map<string, QoderAcp>();
+
+  /**
+   * Start a Qoder session over ACP rather than `qodercli -p`. The difference is
+   * feedback: ACP streams thinking, tool calls and completion as they happen,
+   * and asks for permission in a way the phone can answer. `-p` reports nothing
+   * until its transcript lands.
+   */
+  const startAcpSession = async (prompt: string, cwd: string): Promise<{ ok: boolean; note: string }> => {
+    // Retire the oldest session when at capacity: Map preserves insertion order,
+    // so the first key is the least recently started.
+    while (acpBySession.size >= ACP_MAX_SESSIONS) {
+      const oldest = acpBySession.keys().next().value;
+      if (!oldest) break;
+      acpBySession.get(oldest)?.stop();
+      acpBySession.delete(oldest);
+      console.log(`[watch] ACP 会话已达上限，回收最早的会话 ${oldest.slice(0, 8)}`);
+    }
+
+    let ownSessionId: string | null = null;
+    const acp = new QoderAcp(
+      (e) => {
+        // Reuse the agent-event shape the phone already renders.
+        const event =
+          e.type === "thinking" ? { type: "thinking", text: e.text ?? "" }
+          : e.type === "message" ? { type: "agent-text", text: e.text ?? "" }
+          : e.type === "tool" ? { type: "tool-use", name: e.title ?? "", input: e.kind ?? "" }
+          : e.type === "tool-done" ? { type: "tool-result", text: e.text ?? "", status: e.status ?? "" }
+          : { type: e.type, text: e.text ?? "" };
+        void sendPayload({ kind: "agent-event", sessionId: e.sessionId, agent: "qoder", event });
+      },
+      (perm) => {
+        acpPermissions.set(perm.requestId, acp);
+        void sendPayload({
+          kind: "permission-request",
+          sessionId: perm.sessionId,
+          agent: "qoder",
+          requestId: perm.requestId,
+          toolName: perm.title,
+          summary: perm.title,
+          options: perm.options.map((o) => ({ id: o.id, label: o.label })),
+        });
+      },
+      () => {
+        // The agent died: drop it, or later messages would be routed to a
+        // process that can only reject them.
+        if (ownSessionId) acpBySession.delete(ownSessionId);
+      },
+    );
+    try {
+      await acp.start(cwd);
+      const sessionId = await acp.newSession(cwd);
+      ownSessionId = sessionId;
+      acpBySession.set(sessionId, acp);
+      // Do not await the turn: it can run for minutes, and progress already
+      // streams through the callbacks above.
+      void acp.prompt(sessionId, prompt)
+        .then((stop) => sendPayload({
+          kind: "agent-event", sessionId, agent: "qoder",
+          event: { type: "turn-done", reason: stop },
+        }))
+        .catch((e) => sendPayload({
+          kind: "agent-event", sessionId, agent: "qoder",
+          event: { type: "error", text: `${e instanceof Error ? e.message : e}` },
+        }));
+      return { ok: true, note: `已在 ${cwd} 新建会话（可看到执行过程）` };
+    } catch (e) {
+      acp.stop();
+      return { ok: false, note: `新建失败: ${e instanceof Error ? e.message : e}` };
+    }
+  };
 
   const codexControl = async (): Promise<CodexAppServer> => {
     if (codexServer) return codexServer;
@@ -296,7 +377,11 @@ export async function serveWatch(
           // disk, idle ones included.
           await sendPayload({ kind: "session-list", sessions: listSessions(60) });
         } else if (payload?.kind === "new-session" && payload.text) {
-          const r = startSession(payload.text, payload.cwd);
+          // ACP by default (visible progress + answerable approvals);
+          // AGENTLINK_ACP=0 falls back to the silent `qodercli -p` route.
+          const r = process.env.AGENTLINK_ACP === "0"
+            ? startSession(payload.text, payload.cwd)
+            : await startAcpSession(payload.text, payload.cwd ?? homedir());
           await sendPayload({
             kind: "input-ack",
             sessionId: payload.sessionId ?? "",
@@ -314,6 +399,11 @@ export async function serveWatch(
             note: r.note,
           });
         } else if (payload?.kind === "permission-response" && payload.requestId
+                   && acpPermissions.has(payload.requestId)) {
+          const acp = acpPermissions.get(payload.requestId)!;
+          acpPermissions.delete(payload.requestId);
+          acp.resolvePermission(payload.requestId, String(payload.optionId ?? "cancel"));
+        } else if (payload?.kind === "permission-response" && payload.requestId
                    && pendingApprovals.has(payload.requestId)) {
           // Codex approval: answer the parked app-server request directly.
           const serverReqId = pendingApprovals.get(payload.requestId)!;
@@ -321,9 +411,34 @@ export async function serveWatch(
           codexServer?.respond(serverReqId, {
             decision: payload.optionId === "allow" ? "approved" : "denied",
           });
+        } else if (payload?.kind === "permission-response" && payload.requestId
+                   && !hookServer.hasPending(String(payload.requestId))) {
+          // Neither ACP, Codex, nor a live hook request owns this id — most
+          // likely a stale answer from before a daemon restart. Dropping it beats
+          // handing an unrelated id to the hook server.
+          console.log(`[watch] 忽略过期的审批回应 ${payload.requestId}`);
         } else if (payload?.kind === "permission-response" && payload.requestId) {
           // 手机端审批结果 → 解除 hook 等待
           hookServer.resolvePermission(payload.requestId, payload.optionId ?? "deny");
+        } else if (payload?.kind === "user-input" && payload.text && payload.sessionId
+                   && acpBySession.has(payload.sessionId)) {
+          // Follow-up in a phone-started ACP session: keep it there rather than
+          // falling through to keystroke injection, which would land in whatever
+          // the IDE happens to have open.
+          const acp = acpBySession.get(payload.sessionId)!;
+          const sid = payload.sessionId;
+          void acp.prompt(sid, payload.text)
+            .then((stop) => sendPayload({
+              kind: "agent-event", sessionId: sid, agent: "qoder",
+              event: { type: "turn-done", reason: stop },
+            }))
+            .catch((e) => sendPayload({
+              kind: "agent-event", sessionId: sid, agent: "qoder",
+              event: { type: "error", text: `${e instanceof Error ? e.message : e}` },
+            }));
+          await sendPayload({
+            kind: "input-ack", sessionId: sid, status: "running", note: "已发送到该会话",
+          });
         } else if (payload?.kind === "user-input" && payload.text && payload.sessionId) {
           // 用户输入：注入运行中的 IDE 会话暂不可行 → 入收件箱 + 回执，
           // 手机端据此显示排队状态而不是石沉大海。
@@ -361,6 +476,11 @@ export async function serveWatch(
     watcher.stop();
     codexWatcher.stop();
     hookServer.stop();
+    // Kill the child agents too: ACP sessions are piped children, so they would
+    // otherwise be orphaned holding a model connection each.
+    for (const acp of acpBySession.values()) acp.stop();
+    acpBySession.clear();
+    codexServer?.stop();
   };
 
   return { hookServer, watcher, codexWatcher, stop };

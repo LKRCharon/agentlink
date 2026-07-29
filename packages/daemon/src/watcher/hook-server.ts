@@ -52,6 +52,11 @@ export class HookServer {
     this.server = null;
   }
 
+  /** Whether this id belongs to a hook request still waiting for an answer. */
+  hasPending(requestId: string): boolean {
+    return this.pendingPermissions.has(requestId);
+  }
+
   /** 桥接层调用：手机端审批结果到达后，解除挂起的 hook 请求 */
   resolvePermission(requestId: string, decision: string): void {
     const pending = this.pendingPermissions.get(requestId);
