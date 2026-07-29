@@ -20,6 +20,7 @@ import { TranscriptWatcher, findQoderFiles, findCodexFiles, normalizeQoderLine, 
 import { HookServer } from "./hook-server";
 import { listPeers } from "../store";
 import { createCloudSession, listSessions, startRemoteControl, startSession } from "../sessions";
+import { CodexAppServer } from "../codex-appserver";
 
 export async function serveWatch(
   conn: WsConn,
@@ -149,6 +150,56 @@ export async function serveWatch(
   const watcher = new TranscriptWatcher(onWatchEvent, join(homedir(), ".qoder", "projects"), findQoderFiles, normalizeQoderLine, "qoder");
   watcher.start();
 
+  /** Codex control plane, started on first use (it spawns a process). */
+  let codexServer: CodexAppServer | null = null as CodexAppServer | null;
+  /** Turn currently running per thread, so steer/interrupt have a target. */
+  const activeTurns = new Map<string, string>();
+  /** Approvals awaiting a phone answer: requestId -> app-server request id. */
+  const pendingApprovals = new Map<string, number | string>();
+
+  const codexControl = async (): Promise<CodexAppServer> => {
+    if (codexServer) return codexServer;
+    const srv = new CodexAppServer();
+    srv.onNotification = (method, params) => {
+      const threadId = params?.threadId;
+      // The turn id lives in `turn.id`, not `turnId` (test/fixtures/
+      // fake-codex-appserver.ts). Reading `turnId` here left activeTurns empty
+      // for turns started in the desktop app, so those could never be steered
+      // or interrupted — only turns this daemon started itself worked.
+      const turnId = params?.turnId ?? params?.turn?.id;
+      if (method === "turn/started" && threadId && turnId) {
+        activeTurns.set(threadId, String(turnId));
+      } else if (method === "turn/completed" && threadId) {
+        activeTurns.delete(threadId);
+      }
+      // Forward the control-plane stream under its own kind: these are richer
+      // than transcript events (reasoning deltas, command output deltas) and
+      // the phone renders them separately.
+      void sendPayload({ kind: "codex-event", method, params });
+    };
+    srv.onServerRequest = (id, method, params) => {
+      // Approvals arrive as server->client requests; park the app-server id so
+      // the phone's answer can resolve the right one.
+      const requestId = `codex-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      pendingApprovals.set(requestId, id);
+      void sendPayload({
+        kind: "permission-request",
+        sessionId: String(params?.threadId ?? ""),
+        agent: "codex",
+        requestId,
+        toolName: method,
+        summary: JSON.stringify(params ?? {}).slice(0, 400),
+        options: [
+          { id: "allow", label: "允许" },
+          { id: "deny", label: "拒绝" },
+        ],
+      });
+    };
+    await srv.start();
+    codexServer = srv;
+    return srv;
+  };
+
   const codexWatcher = new TranscriptWatcher(onWatchEvent, join(homedir(), ".codex", "sessions"), findCodexFiles, normalizeCodexLine, "codex");
   codexWatcher.start();
 
@@ -177,7 +228,69 @@ export async function serveWatch(
           cwd?: string;
         }>(msg.data?.enc);
 
-        if (payload?.kind === "list-sessions") {
+        if (payload?.kind === "codex-threads") {
+          // Codex's own view of its threads — richer and more accurate than our
+          // transcript scan (model-generated titles, live status, cwd).
+          try {
+            const srv = await codexControl();
+            await sendPayload({ kind: "codex-thread-list", threads: await srv.listThreads(40) });
+          } catch (e) {
+            await sendPayload({ kind: "codex-error", note: `${e instanceof Error ? e.message : e}` });
+          }
+        } else if (payload?.kind === "codex-resume" && payload.sessionId) {
+          try {
+            const srv = await codexControl();
+            const r = await srv.resume(payload.sessionId);
+            await sendPayload({
+              kind: "codex-resumed",
+              sessionId: payload.sessionId,
+              canAcceptDirectInput: r.canAcceptDirectInput,
+              cwd: r.cwd ?? "",
+              turns: r.turns,
+            });
+          } catch (e) {
+            await sendPayload({ kind: "codex-error", note: `${e instanceof Error ? e.message : e}` });
+          }
+        } else if (payload?.kind === "codex-input" && payload.sessionId && payload.text) {
+          // Real two-way control: this lands in the same thread the desktop app
+          // or VS Code has open, not a separate headless run.
+          try {
+            const srv = await codexControl();
+            await srv.resume(payload.sessionId);
+            const active = activeTurns.get(payload.sessionId);
+            if (active) {
+              // Mid-turn: steer instead of queueing a second turn.
+              await srv.steerTurn(payload.sessionId, active, payload.text);
+            } else {
+              const turnId = await srv.startTurn(payload.sessionId, payload.text);
+              if (turnId) activeTurns.set(payload.sessionId, turnId);
+            }
+            await sendPayload({
+              kind: "input-ack",
+              sessionId: payload.sessionId,
+              status: "running",
+              note: active ? "已插话到进行中的回合" : "已发送到 Codex 会话",
+            });
+          } catch (e) {
+            await sendPayload({
+              kind: "input-ack",
+              sessionId: payload.sessionId,
+              status: "queued",
+              note: `发送失败: ${e instanceof Error ? e.message : e}`,
+            });
+          }
+        } else if (payload?.kind === "codex-interrupt" && payload.sessionId) {
+          try {
+            const srv = await codexControl();
+            const active = activeTurns.get(payload.sessionId);
+            if (!active) throw new Error("该会话当前没有进行中的回合");
+            await srv.interruptTurn(payload.sessionId, active);
+            activeTurns.delete(payload.sessionId);
+            await sendPayload({ kind: "input-ack", sessionId: payload.sessionId, status: "done", note: "已打断" });
+          } catch (e) {
+            await sendPayload({ kind: "codex-error", note: `${e instanceof Error ? e.message : e}` });
+          }
+        } else if (payload?.kind === "list-sessions") {
           // The mirrored stream only ever showed sessions that emitted an event
           // while the phone was connected; this answers with every session on
           // disk, idle ones included.
@@ -199,6 +312,14 @@ export async function serveWatch(
             kind: "cloud-session-url",
             url: r.url ?? "",
             note: r.note,
+          });
+        } else if (payload?.kind === "permission-response" && payload.requestId
+                   && pendingApprovals.has(payload.requestId)) {
+          // Codex approval: answer the parked app-server request directly.
+          const serverReqId = pendingApprovals.get(payload.requestId)!;
+          pendingApprovals.delete(payload.requestId);
+          codexServer?.respond(serverReqId, {
+            decision: payload.optionId === "allow" ? "approved" : "denied",
           });
         } else if (payload?.kind === "permission-response" && payload.requestId) {
           // 手机端审批结果 → 解除 hook 等待
