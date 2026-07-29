@@ -16,7 +16,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -51,6 +51,16 @@ export interface SessionSummary {
   kind: "quest" | "chat";
 }
 
+/** How much of a transcript to read when looking for its first prompt. */
+const HEAD_BYTES = 256 * 1024;
+
+/**
+ * Cache of parsed titles, keyed by path + mtime. A transcript's first prompt
+ * never changes, so a hit is exact; the mtime in the key retires the entry when
+ * the file is rewritten.
+ */
+const titleCache = new Map<string, { title: string; cwd?: string }>();
+
 /** Strip the injected scaffolding that rides along in the user role. */
 function isSyntheticPrompt(text: string): boolean {
   const t = text.trim();
@@ -76,9 +86,18 @@ function oneLine(text: string, max = 80): string {
 function firstPrompt(file: string, agent: "qoder" | "codex"): { title: string; cwd?: string } {
   let head = "";
   try {
-    // 256 KB covers the opening exchange even with large injected context.
-    const buf = readFileSync(file);
-    head = buf.subarray(0, Math.min(buf.length, 256 * 1024)).toString("utf8");
+    // Read only the head. `readFileSync` used to pull the whole file into memory
+    // before slicing — 313 transcripts totalling ~460MB on this machine, read
+    // synchronously on every list refresh, freezing the event loop for ~100ms
+    // warm and ~340ms cold.
+    const fd = openSync(file, "r");
+    try {
+      const buf = Buffer.allocUnsafe(HEAD_BYTES);
+      const n = readSync(fd, buf, 0, HEAD_BYTES, 0);
+      head = buf.subarray(0, n).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     return { title: basename(file) };
   }
@@ -110,6 +129,13 @@ function firstPrompt(file: string, agent: "qoder" | "codex"): { title: string; c
   return { title: basename(file).replace(/\.jsonl$/, ""), cwd };
 }
 
+/** `rollout-<timestamp>-<threadId>.jsonl` -> threadId (app-server's id). */
+function codexThreadId(file: string): string {
+  const base = basename(file).replace(/\.jsonl$/, "");
+  const m = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  return m ? m[1] : base;
+}
+
 function walkFiles(root: string, depth: number, out: string[]): void {
   if (depth < 0) return;
   let entries;
@@ -128,6 +154,17 @@ function walkFiles(root: string, depth: number, out: string[]): void {
  */
 export function listSessions(limit = 60): SessionSummary[] {
   const out: SessionSummary[] = [];
+  const cachedPrompt = (file: string, agent: "qoder" | "codex", mtimeMs: number) => {
+    const key = `${file}:${mtimeMs}`;
+    const hit = titleCache.get(key);
+    if (hit) return hit;
+    const parsed = firstPrompt(file, agent);
+    // Bounded so a long-lived daemon does not accumulate entries for every
+    // transcript that ever existed.
+    if (titleCache.size > 400) titleCache.clear();
+    titleCache.set(key, parsed);
+    return parsed;
+  };
 
   const qoderRoot = join(homedir(), ".qoder", "projects");
   const qoderFiles: string[] = [];
@@ -135,7 +172,7 @@ export function listSessions(limit = 60): SessionSummary[] {
   for (const f of qoderFiles) {
     let updatedAt = 0;
     try { updatedAt = statSync(f).mtimeMs; } catch { continue; }
-    const { title, cwd } = firstPrompt(f, "qoder");
+    const { title, cwd } = cachedPrompt(f, "qoder", updatedAt);
     out.push({
       id: basename(f).replace(/\.jsonl$/, ""),
       title,
@@ -154,9 +191,11 @@ export function listSessions(limit = 60): SessionSummary[] {
   for (const f of codexFiles) {
     let updatedAt = 0;
     try { updatedAt = statSync(f).mtimeMs; } catch { continue; }
-    const { title, cwd } = firstPrompt(f, "codex");
+    const { title, cwd } = cachedPrompt(f, "codex", updatedAt);
     out.push({
-      id: basename(f).replace(/\.jsonl$/, ""),
+      // Trailing uuid, not the whole basename: it is the app-server threadId,
+      // and using anything else splits one session into two cards.
+      id: codexThreadId(f),
       title,
       agent: "codex",
       cwd,

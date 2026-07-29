@@ -122,10 +122,18 @@ export async function serveWatch(
   let sessionCount = 0;
   const knownSessions = new Set<string>();
 
-  // parseLines fires events without awaiting; chaining keeps seal/send order
-  // deterministic (async seals otherwise race and arrive out of order) and
-  // catches send failures so they don't surface as unhandled rejections.
+  // Every asynchronous producer (transcript, ACP, app-server notifications,
+  // approvals) must post through this one chain. Sealing is async, so parallel
+  // sends race and the phone receives streamed text out of order — the chain
+  // used to cover only the transcript path.
   let sendChain: Promise<void> = Promise.resolve();
+  const enqueueSend = (payload: unknown): void => {
+    sendChain = sendChain
+      .then(() => sendPayload(payload))
+      .catch((err) => {
+        console.log(`[watch] 推送失败: ${err instanceof Error ? err.message : err}`);
+      });
+  };
 
   const onWatchEvent = (sessionId: string, agent: string, event: NormalizedEvent): void => {
     sendChain = sendChain
@@ -164,6 +172,14 @@ export async function serveWatch(
    * processes for the lifetime of the daemon.
    */
   const acpBySession = new Map<string, QoderAcp>();
+  /**
+   * Sessions that were ACP-owned at some point, kept after the agent dies.
+   * Without this, a follow-up message for a dead session fell through to
+   * keystroke injection — which pastes into whatever the IDE currently has open
+   * and presses Return, i.e. runs the prompt in an unrelated conversation while
+   * telling the phone it was delivered.
+   */
+  const acpRetired = new Set<string>();
   const ACP_MAX_SESSIONS = 4;
   /** Which ACP agent parked which permission request. */
   const acpPermissions = new Map<string, QoderAcp>();
@@ -182,24 +198,28 @@ export async function serveWatch(
       if (!oldest) break;
       acpBySession.get(oldest)?.stop();
       acpBySession.delete(oldest);
+      acpRetired.add(oldest);
       console.log(`[watch] ACP 会话已达上限，回收最早的会话 ${oldest.slice(0, 8)}`);
     }
 
     let ownSessionId: string | null = null;
     const acp = new QoderAcp(
       (e) => {
-        // Reuse the agent-event shape the phone already renders.
+        // These type names are a contract with the phone's buildFeed: it only
+        // renders text / user-text / thinking / tool-call / tool-result /
+        // turn-done, and reads error text from `message`. Inventing synonyms
+        // ("agent-text", "tool-use") silently dropped the agent's own replies.
         const event =
           e.type === "thinking" ? { type: "thinking", text: e.text ?? "" }
-          : e.type === "message" ? { type: "agent-text", text: e.text ?? "" }
-          : e.type === "tool" ? { type: "tool-use", name: e.title ?? "", input: e.kind ?? "" }
-          : e.type === "tool-done" ? { type: "tool-result", text: e.text ?? "", status: e.status ?? "" }
+          : e.type === "message" ? { type: "text", text: e.text ?? "" }
+          : e.type === "tool" ? { type: "tool-call", name: e.title ?? "", summary: e.kind ?? "" }
+          : e.type === "tool-done" ? { type: "tool-result", name: e.status ?? "", summary: e.text ?? "" }
           : { type: e.type, text: e.text ?? "" };
-        void sendPayload({ kind: "agent-event", sessionId: e.sessionId, agent: "qoder", event });
+        enqueueSend({ kind: "agent-event", sessionId: e.sessionId, agent: "qoder", event });
       },
       (perm) => {
         acpPermissions.set(perm.requestId, acp);
-        void sendPayload({
+        enqueueSend({
           kind: "permission-request",
           sessionId: perm.sessionId,
           agent: "qoder",
@@ -212,7 +232,10 @@ export async function serveWatch(
       () => {
         // The agent died: drop it, or later messages would be routed to a
         // process that can only reject them.
-        if (ownSessionId) acpBySession.delete(ownSessionId);
+        if (ownSessionId) {
+          acpBySession.delete(ownSessionId);
+          acpRetired.add(ownSessionId);
+        }
       },
     );
     try {
@@ -229,7 +252,7 @@ export async function serveWatch(
         }))
         .catch((e) => sendPayload({
           kind: "agent-event", sessionId, agent: "qoder",
-          event: { type: "error", text: `${e instanceof Error ? e.message : e}` },
+          event: { type: "error", message: `${e instanceof Error ? e.message : e}` },
         }));
       return { ok: true, note: `已在 ${cwd} 新建会话（可看到执行过程）` };
     } catch (e) {
@@ -239,7 +262,19 @@ export async function serveWatch(
   };
 
   const codexControl = async (): Promise<CodexAppServer> => {
-    if (codexServer) return codexServer;
+    if (codexServer) {
+      // Always re-run start(): it is a no-op while connected, and after a socket
+      // close (app restart, sleep) it reconnects. Returning the cached instance
+      // blindly left every codex feature failing until the daemon restarted.
+      try {
+        await codexServer.start();
+        return codexServer;
+      } catch (e) {
+        codexServer.stop();
+        codexServer = null;
+        throw e;
+      }
+    }
     const srv = new CodexAppServer();
     srv.onNotification = (method, params) => {
       const threadId = params?.threadId;
@@ -250,20 +285,24 @@ export async function serveWatch(
       const turnId = params?.turnId ?? params?.turn?.id;
       if (method === "turn/started" && threadId && turnId) {
         activeTurns.set(threadId, String(turnId));
-      } else if (method === "turn/completed" && threadId) {
+      } else if (threadId && (method === "turn/completed" || method === "turn/aborted"
+                              || method === "turn/failed")) {
+        // Not just completed: a turn interrupted on the desktop ends as
+        // `turn/aborted`, and leaving its id in the map made every later phone
+        // message steer a turn that no longer exists.
         activeTurns.delete(threadId);
       }
       // Forward the control-plane stream under its own kind: these are richer
       // than transcript events (reasoning deltas, command output deltas) and
       // the phone renders them separately.
-      void sendPayload({ kind: "codex-event", method, params });
+      enqueueSend({ kind: "codex-event", method, params });
     };
     srv.onServerRequest = (id, method, params) => {
       // Approvals arrive as server->client requests; park the app-server id so
       // the phone's answer can resolve the right one.
       const requestId = `codex-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       pendingApprovals.set(requestId, id);
-      void sendPayload({
+      enqueueSend({
         kind: "permission-request",
         sessionId: String(params?.threadId ?? ""),
         agent: "codex",
@@ -339,10 +378,19 @@ export async function serveWatch(
             const srv = await codexControl();
             await srv.resume(payload.sessionId);
             const active = activeTurns.get(payload.sessionId);
+            let steered = false;
             if (active) {
               // Mid-turn: steer instead of queueing a second turn.
-              await srv.steerTurn(payload.sessionId, active, payload.text);
-            } else {
+              try {
+                await srv.steerTurn(payload.sessionId, active, payload.text);
+                steered = true;
+              } catch {
+                // The turn ended without us hearing about it; drop the stale id
+                // and fall back to a fresh turn rather than failing outright.
+                activeTurns.delete(payload.sessionId);
+              }
+            }
+            if (!steered) {
               const turnId = await srv.startTurn(payload.sessionId, payload.text);
               if (turnId) activeTurns.set(payload.sessionId, turnId);
             }
@@ -365,8 +413,10 @@ export async function serveWatch(
             const srv = await codexControl();
             const active = activeTurns.get(payload.sessionId);
             if (!active) throw new Error("该会话当前没有进行中的回合");
-            await srv.interruptTurn(payload.sessionId, active);
+            // Delete first: if interrupt throws, the id is stale either way and
+            // keeping it would wedge every later message into a failing steer.
             activeTurns.delete(payload.sessionId);
+            await srv.interruptTurn(payload.sessionId, active);
             await sendPayload({ kind: "input-ack", sessionId: payload.sessionId, status: "done", note: "已打断" });
           } catch (e) {
             await sendPayload({ kind: "codex-error", note: `${e instanceof Error ? e.message : e}` });
@@ -434,10 +484,17 @@ export async function serveWatch(
             }))
             .catch((e) => sendPayload({
               kind: "agent-event", sessionId: sid, agent: "qoder",
-              event: { type: "error", text: `${e instanceof Error ? e.message : e}` },
+              event: { type: "error", message: `${e instanceof Error ? e.message : e}` },
             }));
           await sendPayload({
             kind: "input-ack", sessionId: sid, status: "running", note: "已发送到该会话",
+          });
+        } else if (payload?.kind === "user-input" && payload.sessionId
+                   && acpRetired.has(payload.sessionId)) {
+          // Dead ACP session: say so instead of injecting into the IDE.
+          await sendPayload({
+            kind: "input-ack", sessionId: payload.sessionId, status: "queued",
+            note: "该会话的 agent 进程已结束，请新建会话",
           });
         } else if (payload?.kind === "user-input" && payload.text && payload.sessionId) {
           // 用户输入：注入运行中的 IDE 会话暂不可行 → 入收件箱 + 回执，

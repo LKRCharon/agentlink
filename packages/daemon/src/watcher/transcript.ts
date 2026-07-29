@@ -114,8 +114,14 @@ export class TranscriptWatcher {
   }
 
   private extractSessionId(filePath: string): string {
-    const base = filePath.split("/").pop() ?? filePath;
-    return base.replace(/\.jsonl$/, "");
+    const base = (filePath.split("/").pop() ?? filePath).replace(/\.jsonl$/, "");
+    // Codex rollout files are named `rollout-<timestamp>-<threadId>`, and that
+    // trailing uuid is exactly the app-server threadId (verified against
+    // session_meta.payload.id). Using the whole basename gave codex sessions two
+    // different ids: the phone showed one card per id, and the card with the
+    // content could not accept input because thread/resume rejects it.
+    const m = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+    return m ? m[1] : base;
   }
 
   private parseLines(data: string, sessionId: string): void {
