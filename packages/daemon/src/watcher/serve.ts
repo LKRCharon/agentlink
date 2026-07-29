@@ -361,6 +361,9 @@ export async function serveWatch(
           cwd?: string;
         }>(msg.data?.enc);
 
+        if (payload?.kind) {
+          console.log(`[watch] 收到手机指令: ${payload.kind}`);
+        }
         if (payload?.kind === "codex-threads") {
           // Codex's own view of its threads — richer and more accurate than our
           // transcript scan (model-generated titles, live status, cwd).
@@ -440,7 +443,9 @@ export async function serveWatch(
           // The mirrored stream only ever showed sessions that emitted an event
           // while the phone was connected; this answers with every session on
           // disk, idle ones included.
-          await sendPayload({ kind: "session-list", sessions: listSessions(60) });
+          const rows = listSessions(60);
+          console.log(`[watch] 返回会话目录 ${rows.length} 条`);
+          await sendPayload({ kind: "session-list", sessions: rows });
         } else if (payload?.kind === "new-session" && payload.text) {
           // ACP by default (visible progress + answerable approvals);
           // AGENTLINK_ACP=0 falls back to the silent `qodercli -p` route.
