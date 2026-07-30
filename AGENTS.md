@@ -1,7 +1,7 @@
 # AGENTS.md — agentlink
 
 Full guidance for all three Argus repos lives in the Argus repo:
-`~/proj/eclam/AGENTS.md` — read it before changing anything here.
+`the Argus repo (github.com/LKRCharon/argus) AGENTS.md` — read it before changing anything here.
 
 Quick reference for this repo:
 

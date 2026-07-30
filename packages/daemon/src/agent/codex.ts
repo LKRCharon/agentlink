@@ -6,7 +6,7 @@
  *   1. ChatGPT 账号（codex login）
  *   2. API 模式 A：OPENAI_API_KEY / CODEX_API_KEY 环境变量
  *   3. API 模式 B：~/.codex/config.toml 配置 preferred_auth_method = "apikey"
- *   4. 自定义 provider（如 sub2api 等 OpenAI 兼容网关）：config.toml 的
+ *   4. 自定义 provider（如 your-gateway 等 OpenAI 兼容网关）：config.toml 的
  *      [model_providers.xxx] base_url + env_key，配合 AGENTLINK_CODEX_PROVIDER 指定
  * 启动前用 `codex login status` 做预检，未登录时报错并给出上述 API 模式指引。
  *
@@ -42,10 +42,10 @@ const APPROVAL_OPTIONS: PermissionOption[] = [
 const AUTH_GUIDANCE = `codex 未登录。可选认证方式（API 模式不依赖 ChatGPT）：
   1. API Key:  export OPENAI_API_KEY=...（或 CODEX_API_KEY）
   2. 配置文件:  ~/.codex/config.toml 设置 preferred_auth_method = "apikey"
-  3. 自定义 provider（OpenAI 兼容网关，如 sub2api）:
+  3. 自定义 provider（OpenAI 兼容网关，如 your-gateway）:
        [model_providers.my]
        name = "my"
-       base_url = "https://你的网关/v1"
+       base_url = "https://your-gateway.example.com/v1"
        env_key = "OPENAI_API_KEY"
      然后 AGENTLINK_CODEX_PROVIDER=my 再启动
   4. ChatGPT 账号:  codex login（国内网络环境通常不可用）`;
