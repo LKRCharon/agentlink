@@ -366,7 +366,15 @@ export async function serveWatch(
           agent?: string;
         }>(msg.data?.enc);
 
-        if (payload?.kind) {
+        // Only log genuine phone->daemon commands. Relay buffering can echo a
+        // daemon->phone kind (agent-event, session-list, …) back at us; those
+        // match no command branch below and are just noise in the log.
+        const PHONE_COMMANDS = new Set([
+          "list-sessions", "new-session", "user-input", "permission-response",
+          "codex-threads", "codex-resume", "codex-input", "codex-interrupt",
+          "cloud-session", "remote-control",
+        ]);
+        if (payload?.kind && PHONE_COMMANDS.has(payload.kind)) {
           console.log(`[watch] 收到手机指令: ${payload.kind}`);
         }
         if (payload?.kind === "codex-threads") {

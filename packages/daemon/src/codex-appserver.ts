@@ -31,14 +31,23 @@ export interface CodexThread {
   /** "notLoaded" until resumed; then idle / running / … */
   status: string;
   /**
-   * cli | vscode | exec | appServer | …
+   * cli | vscode | exec | appServer | subAgent | …
    *
    * The Codex desktop app reports `vscode`, not `appServer`: it is a VS Code
    * shell (app-server's own userAgent carries `vscode/1.106.3`, and the app
    * ships a `codex_vscode_copilot` originator for the real extension). This is
    * accurate, not stale data — do not "clean it up" by filtering vscode out.
+   *
+   * Sub-agent threads report an *object* here, not a string, which is why the
+   * three fields below are extracted rather than left to callers.
    */
   source?: string | null;
+  /** Set when this thread was spawned by another agent. */
+  parentThreadId?: string | null;
+  /** The codename the parent gave it ("Pauli", "Hilbert"). */
+  agentNickname?: string | null;
+  /** Nesting level; 1 means spawned directly by a top-level thread. */
+  depth?: number | null;
   updatedAt: number;
   /** False for threads that cannot take input (e.g. sub-agent threads). */
   canAcceptDirectInput: boolean;
@@ -49,6 +58,27 @@ type Pending = {
   reject: (e: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 };
+
+/**
+ * Pull the spawn details out of a thread's `source`.
+ *
+ * A top-level thread's source is a plain string ("vscode"); a spawned one is
+ * `{ subAgent: { thread_spawn: { parent_thread_id, depth, agent_nickname } } }`.
+ * Treating both as strings yielded "[object Object]" and lost the parent link,
+ * which is the only thing tying an agent to the work that started it.
+ */
+function describeSpawn(source: unknown):
+  { parentThreadId: string; depth: number; nickname: string | null } | null {
+  if (!source || typeof source !== "object") return null;
+  const sub = (source as any).subAgent ?? (source as any).subagent;
+  const spawn = sub?.thread_spawn ?? sub?.threadSpawn;
+  if (!spawn?.parent_thread_id && !spawn?.parentThreadId) return null;
+  return {
+    parentThreadId: String(spawn.parent_thread_id ?? spawn.parentThreadId),
+    depth: Number(spawn.depth ?? 1),
+    nickname: spawn.agent_nickname ?? spawn.agentNickname ?? null,
+  };
+}
 
 /**
  * Turn history -> the phone's event vocabulary (text / user-text / thinking /
@@ -252,21 +282,33 @@ export class CodexAppServer {
       // Omitting sourceKinds returns only "interactive sources" and answers
       // with zero rows on a machine full of sessions. `vscode` is what the
       // desktop app's own threads are tagged with, so it has to be in here.
-      sourceKinds: ["cli", "vscode", "exec", "appServer"],
+      // The subAgent kinds matter too: without them, agents spawned by another
+      // agent are filtered out and their work is invisible.
+      sourceKinds: [
+        "cli", "vscode", "exec", "appServer",
+        "subAgent", "subAgentReview", "subAgentCompact",
+        "subAgentThreadSpawn", "subAgentOther",
+      ],
       limit,
     });
     const rows: any[] = res?.data ?? [];
-    return rows.map((t) => ({
-      id: String(t.id),
-      preview: String(t.preview ?? ""),
-      name: t.name ?? null,
-      cwd: t.cwd ?? null,
-      status: typeof t.status === "object" ? String(t.status?.type ?? "unknown") : String(t.status ?? "unknown"),
-      source: t.source ?? null,
-      updatedAt: Number(t.updatedAt ?? 0) * 1000,
-      // Only meaningful once resumed; unresumed threads report null.
-      canAcceptDirectInput: t.canAcceptDirectInput === true,
-    }));
+    return rows.map((t) => {
+      const spawn = describeSpawn(t.source);
+      return {
+        id: String(t.id),
+        preview: String(t.preview ?? ""),
+        name: t.name ?? null,
+        cwd: t.cwd ?? null,
+        status: typeof t.status === "object" ? String(t.status?.type ?? "unknown") : String(t.status ?? "unknown"),
+        source: spawn ? "subAgent" : (typeof t.source === "string" ? t.source : null),
+        parentThreadId: spawn?.parentThreadId ?? t.parentThreadId ?? null,
+        agentNickname: spawn?.nickname ?? t.agentNickname ?? null,
+        depth: spawn?.depth ?? null,
+        updatedAt: Number(t.updatedAt ?? 0) * 1000,
+        // Only meaningful once resumed; unresumed threads report null.
+        canAcceptDirectInput: t.canAcceptDirectInput === true,
+      };
+    });
   }
 
   /**
