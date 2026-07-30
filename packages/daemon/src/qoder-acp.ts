@@ -59,6 +59,10 @@ type Pending = { resolve: (v: any) => void; reject: (e: Error) => void; timer: R
 
 export class QoderAcp {
   private proc: ChildProcess | null = null;
+  /** Accumulating streamed text per session, flushed as one message. */
+  private textBuffer = new Map<string, string>();
+  private thinkBuffer = new Map<string, string>();
+  private flushTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private buffer = "";
@@ -126,6 +130,9 @@ export class QoderAcp {
         sessionId,
         prompt: [{ type: "text", text }],
       }, 30 * 60_000);
+      // Flush before reporting the turn as done, or the final reply is stranded
+      // in the buffer and the phone shows a completed turn with no answer.
+      this.flushStreamed(sessionId);
       return String(res?.stopReason ?? "end_turn");
     } catch (e) {
       // On timeout the agent may still be working on a turn no one is watching
@@ -227,10 +234,10 @@ export class QoderAcp {
     const emit = (e: Omit<AcpEvent, "sessionId">) => this.onEvent({ sessionId, ...e });
     switch (u.sessionUpdate) {
       case "agent_thought_chunk":
-        emit({ type: "thinking", text: String(u.content?.text ?? "") });
+        this.appendStreamed(sessionId, "thinking", String(u.content?.text ?? ""));
         break;
       case "agent_message_chunk":
-        emit({ type: "message", text: String(u.content?.text ?? "") });
+        this.appendStreamed(sessionId, "message", String(u.content?.text ?? ""));
         break;
       case "tool_call":
         // `title` is Qoder's own wording ("Write /path/to/file"), which is
@@ -250,7 +257,48 @@ export class QoderAcp {
     }
   }
 
+  /**
+   * Collect a streamed fragment, emitting the whole run shortly after it stops
+   * growing. Markdown only parses correctly as a complete document, so a reply
+   * has to reach the phone in one piece.
+   */
+  private appendStreamed(sessionId: string, kind: "message" | "thinking", text: string): void {
+    if (!text) return;
+    const buffer = kind === "message" ? this.textBuffer : this.thinkBuffer;
+    buffer.set(sessionId, (buffer.get(sessionId) ?? "") + text);
+    const pending = this.flushTimers.get(sessionId);
+    if (pending) clearTimeout(pending);
+    // 600ms of silence: a model can pause mid-sentence while thinking, and a
+    // shorter window split replies at exactly the wrong places (the first token
+    // "**" arrived as its own message). The turn's end flushes anyway, so this
+    // only bounds how long a *complete* paragraph waits.
+    this.flushTimers.set(sessionId, setTimeout(() => this.flushStreamed(sessionId), 600));
+  }
+
+  /** Emit whatever has accumulated, thinking first so the order reads right. */
+  private flushStreamed(sessionId: string): void {
+    const pending = this.flushTimers.get(sessionId);
+    if (pending) {
+      clearTimeout(pending);
+      this.flushTimers.delete(sessionId);
+    }
+    const thought = this.thinkBuffer.get(sessionId);
+    if (thought) {
+      this.thinkBuffer.delete(sessionId);
+      this.onEvent({ sessionId, type: "thinking", text: thought });
+    }
+    const message = this.textBuffer.get(sessionId);
+    if (message) {
+      this.textBuffer.delete(sessionId);
+      this.onEvent({ sessionId, type: "message", text: message });
+    }
+  }
+
   private handleExit(): void {
+    for (const [, t] of this.flushTimers) clearTimeout(t);
+    this.flushTimers.clear();
+    this.textBuffer.clear();
+    this.thinkBuffer.clear();
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
       p.reject(new Error("ACP 进程已退出"));

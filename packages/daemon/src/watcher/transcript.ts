@@ -198,6 +198,11 @@ export function normalizeQoderLine(line: unknown): NormalizedEvent[] {
         events.push({ type: "text", text: block.text });
       } else if (block.type === "thinking" && block.thinking) {
         events.push({ type: "thinking", text: String(block.thinking).slice(0, 300) });
+      } else if (block.type === "redacted_thinking") {
+        // Encrypted reasoning: the content is unreadable by design, but dropping
+        // the block entirely made a turn look like it skipped straight to the
+        // answer with no thinking at all.
+        events.push({ type: "thinking", text: "（已加密的推理内容）" });
       } else if (block.type === "tool_use") {
         events.push({
           type: "tool-call",
